@@ -22,7 +22,6 @@ with open(KB_PATH, "r", encoding="utf-8") as f:
 
 app = FastAPI(title="RAG Colosseum Server (OpenRouter)")
 
-# Required by exam gauntlet: Access-Control-Allow-Origin: *
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,6 +36,67 @@ OPENROUTER_BASE_URL = os.environ.get(
     "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
 ).strip()
 LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-4o-mini").strip()
+
+ENTITY_PHRASES = [
+    "multi-paxos",
+    "raft consensus",
+    "raft",
+    "epidemic gossip",
+    "gossip",
+    "swim membership",
+    "swim",
+    "two-phase commit",
+    "three-phase commit",
+    "saga pattern",
+    "saga",
+    "consistent hashing",
+    "rendezvous hashing",
+    "vector clocks",
+    "hybrid logical clocks",
+    "stochastic gradient descent",
+    "adamw",
+    "transformer encoders",
+    "autoregressive transformer decoders",
+    "binary logistic regression",
+    "support vector machines",
+    "multi-layer perceptrons",
+    "residual convolutional networks",
+    "batch normalization",
+    "layer normalization",
+    "postgresql",
+    "mysql innodb",
+    "innodb",
+    "b+ tree",
+    "log-structured merge",
+    "mongodb",
+    "apache cassandra",
+    "cassandra",
+    "redis",
+    "memcached",
+    "write-ahead logging",
+    "shadow paging",
+    "transmission control protocol",
+    "quic",
+    "multicast dns",
+    "domain name system",
+    "http/2",
+    "http/3",
+    "tls 1.3",
+    "tls 1.2",
+    "border gateway protocol",
+    "open shortest path first",
+    "public key cryptography",
+    "elliptic curve cryptography",
+    "pbkdf2",
+    "argon2",
+    "web application firewalls",
+    "api gateways",
+    "advanced encryption standard",
+    "chacha20-poly1305",
+    "chacha20",
+    "oauth 2.0",
+    "json web tokens",
+]
 
 
 def get_client() -> AsyncOpenAI:
@@ -104,6 +164,7 @@ def build_tfidf_index(passages: List[str]) -> Tuple[Dict[str, int], np.ndarray, 
 
 VOCAB, IDF, TFIDF_MATRIX = build_tfidf_index(PASSAGES)
 PASSAGE_TOKEN_SETS = [set(tokenize_terms(p)) for p in PASSAGES]
+PASSAGE_LOWER = [p.lower() for p in PASSAGES]
 
 
 def clamp01(val: float) -> float:
@@ -111,6 +172,7 @@ def clamp01(val: float) -> float:
 
 
 def retrieve_passages(query: str, top_k: int = 5) -> List[Tuple[int, str, float]]:
+    q_lower = query.lower()
     q_tokens = tokenize_terms(query)
     if not q_tokens:
         return []
@@ -130,12 +192,24 @@ def retrieve_passages(query: str, top_k: int = 5) -> List[Tuple[int, str, float]
     else:
         tfidf_scores = np.zeros(len(PASSAGES), dtype=np.float32)
 
+    matched_entities = [ent for ent in ENTITY_PHRASES if ent in q_lower]
+
     q_set = set(q_tokens)
     scored: List[Tuple[int, str, float]] = []
     for idx, passage in enumerate(PASSAGES):
         p_set = PASSAGE_TOKEN_SETS[idx]
+        p_lower = PASSAGE_LOWER[idx]
         overlap = len(q_set & p_set) / max(len(q_set), 1)
-        combined = clamp01(0.65 * float(tfidf_scores[idx]) + 0.35 * float(overlap))
+        base = 0.60 * float(tfidf_scores[idx]) + 0.40 * float(overlap)
+
+        entity_adj = 0.0
+        for ent in matched_entities:
+            if ent in p_lower:
+                entity_adj += 0.25
+            else:
+                entity_adj -= 0.10
+
+        combined = clamp01(base + entity_adj)
         scored.append((idx, passage, combined))
 
     scored.sort(key=lambda x: x[2], reverse=True)
@@ -181,7 +255,7 @@ def health():
 async def query_kb(req: QueryRequest):
     try:
         hits = retrieve_passages(req.question, top_k=5)
-        if not hits or hits[0][2] < 0.12:
+        if not hits or hits[0][2] < 0.14:
             return QueryResponse(
                 answer="I cannot answer this based on the provided knowledge base.",
                 sources=[],
@@ -223,7 +297,7 @@ async def query_kb(req: QueryRequest):
 
         top_score = hits[0][2]
         relevant_hits = [
-            h for h in hits if h[2] >= max(0.14, top_score * 0.72)
+            h for h in hits if h[2] >= max(0.18, top_score * 0.85)
         ] or [hits[0]]
         sources = [int(h[0]) for h in relevant_hits]
         scores = [clamp01(h[2]) for h in relevant_hits]
