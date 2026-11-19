@@ -1,11 +1,14 @@
+import asyncio
 import json
 import os
 import re
+import traceback
 from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
@@ -17,8 +20,18 @@ with open(KB_PATH, "r", encoding="utf-8") as f:
 
 app = FastAPI(title="RAG Colosseum Server")
 
+# Required by exam gauntlet: Access-Control-Allow-Origin: *
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 _client: AsyncOpenAI | None = None
 _passage_embeddings: np.ndarray | None = None
+_emb_lock = asyncio.Lock()
 
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
@@ -28,10 +41,10 @@ def get_client() -> AsyncOpenAI:
     global _client
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
+        raise RuntimeError("Missing OPENAI_API_KEY environment variable in Render.")
     if _client is None:
         base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or None
-        _client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        _client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=6.0)
     return _client
 
 
@@ -41,12 +54,13 @@ def tokenize(text: str) -> set:
 
 async def get_passage_embeddings() -> np.ndarray:
     global _passage_embeddings
-    if _passage_embeddings is None:
-        client = get_client()
-        resp = await client.embeddings.create(model=EMBED_MODEL, input=PASSAGES)
-        arr = np.array([item.embedding for item in resp.data], dtype=np.float32)
-        norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
-        _passage_embeddings = arr / norms
+    async with _emb_lock:
+        if _passage_embeddings is None:
+            client = get_client()
+            resp = await client.embeddings.create(model=EMBED_MODEL, input=PASSAGES)
+            arr = np.array([item.embedding for item in resp.data], dtype=np.float32)
+            norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
+            _passage_embeddings = arr / norms
     return _passage_embeddings
 
 
@@ -61,7 +75,7 @@ async def retrieve_passages(query: str, top_k: int = 5) -> List[Tuple[int, str, 
     dense_scores = p_emb @ q_vec
     q_tokens = tokenize(query)
 
-    results = []
+    results: List[Tuple[int, str, float]] = []
     for idx, passage in enumerate(PASSAGES):
         p_tokens = tokenize(passage)
         overlap = len(q_tokens & p_tokens) / max(len(q_tokens), 1)
@@ -97,36 +111,42 @@ def health():
 
 @app.post("/query", response_model=QueryResponse)
 async def query_kb(req: QueryRequest):
-    hits = await retrieve_passages(req.question, top_k=5)
-    if not hits or hits[0][2] < 0.42:
-        return QueryResponse(
-            answer="I cannot answer this based on the provided knowledge base.",
-            retrieved_ids=[h[0] for h in hits],
-            abstained=True,
+    try:
+        hits = await retrieve_passages(req.question, top_k=5)
+        if not hits or hits[0][2] < 0.42:
+            return QueryResponse(
+                answer="I cannot answer this based on the provided knowledge base.",
+                retrieved_ids=[h[0] for h in hits],
+                abstained=True,
+            )
+
+        client = get_client()
+        context_blocks = "\n".join(f"[Passage {i}]: {t}" for i, t, _ in hits)
+
+        completion = await client.chat.completions.create(
+            model=LLM_MODEL,
+            temperature=0.0,
+            max_tokens=200,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"<context>\n{context_blocks}\n</context>\n\n<question>\n{req.question}\n</question>",
+                },
+            ],
+            timeout=6.0,
         )
 
-    client = get_client()
-    context_blocks = "\n".join(f"[Passage {i}]: {t}" for i, t, _ in hits)
+        answer_text = (completion.choices[0].message.content or "").strip()
+        if not answer_text:
+            answer_text = "I cannot answer this based on the provided knowledge base."
 
-    completion = await client.chat.completions.create(
-        model=LLM_MODEL,
-        temperature=0.0,
-        max_tokens=250,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"<context>\n{context_blocks}\n</context>\n\n<question>\n{req.question}\n</question>",
-            },
-        ],
-        timeout=15.0,
-    )
-
-    answer_text = completion.choices[0].message.content.strip()
-    abstained = "cannot answer this based on the provided knowledge base" in answer_text.lower()
-
-    return QueryResponse(
-        answer=answer_text,
-        retrieved_ids=[h[0] for h in hits],
-        abstained=abstained,
-    )
+        abstained = "cannot answer this based on the provided knowledge base" in answer_text.lower()
+        return QueryResponse(
+            answer=answer_text,
+            retrieved_ids=[h[0] for h in hits],
+            abstained=abstained,
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(exc))
