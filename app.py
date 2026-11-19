@@ -5,7 +5,8 @@ import re
 import traceback
 from pathlib import Path
 from typing import List, Tuple
-
+import httpx
+from openai import AsyncOpenAI
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,7 +45,12 @@ def get_client() -> AsyncOpenAI:
         raise RuntimeError("Missing OPENAI_API_KEY environment variable in Render.")
     if _client is None:
         base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or None
-        _client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=6.0)
+        http_client = httpx.AsyncClient(timeout=6.0)
+        _client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            http_client=http_client,
+        )
     return _client
 
 
