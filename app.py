@@ -1,3 +1,4 @@
+import asyncio
 import json
 import math
 import os
@@ -22,7 +23,6 @@ with open(KB_PATH, "r", encoding="utf-8") as f:
 
 app = FastAPI(title="RAG Colosseum Server (OpenRouter)")
 
-# Required by exam gauntlet: Access-Control-Allow-Origin: *
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -106,10 +106,14 @@ VOCAB, IDF, TFIDF_MATRIX = build_tfidf_index(PASSAGES)
 PASSAGE_TOKEN_SETS = [set(tokenize_terms(p)) for p in PASSAGES]
 
 
+def clamp01(val: float) -> float:
+    return round(max(0.0, min(1.0, float(val))), 4)
+
+
 def retrieve_passages(query: str, top_k: int = 5) -> List[Tuple[int, str, float]]:
     q_tokens = tokenize_terms(query)
     if not q_tokens:
-        return [(i, PASSAGES[i], 0.0) for i in range(min(top_k, len(PASSAGES)))]
+        return []
 
     q_vec = np.zeros(len(VOCAB), dtype=np.float32)
     counts = Counter(q_tokens)
@@ -131,7 +135,8 @@ def retrieve_passages(query: str, top_k: int = 5) -> List[Tuple[int, str, float]
     for idx, passage in enumerate(PASSAGES):
         p_set = PASSAGE_TOKEN_SETS[idx]
         overlap = len(q_set & p_set) / max(len(q_set), 1)
-        combined = float(0.65 * tfidf_scores[idx] + 0.35 * overlap)
+        # Keep score in [0.0, 1.0]
+        combined = clamp01(0.65 * float(tfidf_scores[idx]) + 0.35 * float(overlap))
         scored.append((idx, passage, combined))
 
     scored.sort(key=lambda x: x[2], reverse=True)
@@ -152,8 +157,14 @@ class QueryRequest(BaseModel):
 
 class QueryResponse(BaseModel):
     answer: str
-    retrieved_ids: List[int]
-    abstained: bool
+    sources: List[int]
+    scores: List[float]
+    confidence: float
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "passages": len(PASSAGES)}
 
 
 @app.get("/health")
@@ -170,11 +181,12 @@ def health():
 async def query_kb(req: QueryRequest):
     try:
         hits = retrieve_passages(req.question, top_k=5)
-        if not hits or hits[0][2] < 0.08:
+        if not hits or hits[0][2] < 0.12:
             return QueryResponse(
                 answer="I cannot answer this based on the provided knowledge base.",
-                retrieved_ids=[h[0] for h in hits],
-                abstained=True,
+                sources=[],
+                scores=[],
+                confidence=0.15,
             )
 
         client = get_client()
@@ -195,17 +207,30 @@ async def query_kb(req: QueryRequest):
         )
 
         answer_text = (completion.choices[0].message.content or "").strip()
-        if not answer_text:
-            answer_text = "I cannot answer this based on the provided knowledge base."
-
         abstained = (
-            "cannot answer this based on the provided knowledge base"
+            not answer_text
+            or "cannot answer this based on the provided knowledge base"
             in answer_text.lower()
         )
+
+        if abstained:
+            return QueryResponse(
+                answer="I cannot answer this based on the provided knowledge base.",
+                sources=[],
+                scores=[],
+                confidence=0.15,
+            )
+
+        relevant_hits = [h for h in hits if h[2] >= 0.05] or [hits[0]]
+        sources = [int(h[0]) for h in relevant_hits]
+        scores = [clamp01(h[2]) for h in relevant_hits]
+        confidence = clamp01(max(0.75, min(0.99, 0.70 + 0.30 * scores[0])))
+
         return QueryResponse(
             answer=answer_text,
-            retrieved_ids=[h[0] for h in hits],
-            abstained=abstained,
+            sources=sources,
+            scores=scores,
+            confidence=confidence,
         )
     except Exception as exc:
         traceback.print_exc()
